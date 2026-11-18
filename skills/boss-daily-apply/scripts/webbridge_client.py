@@ -1,0 +1,1154 @@
+#!/usr/bin/env python3
+"""
+WebBridge HTTP 客户端 — 共享模块
+
+所有 BOSS 脚本通过此模块与 Kimi WebBridge 通信。
+提供 decrypt_salary、extract_jobs、handle_popup 等 Boss直聘专用工具函数。
+
+核心设计:
+  - 全局单一 SESSION，所有脚本复用同一个标签页
+  - api() 自带 3 次重试
+  - extract_jobs() 内置 Vue $props.data 提取 + DOM 兜底
+  - handle_popup() 处理"好"/"确定"弹窗（含第120份投递弹窗）
+  - ProgressManager 管理断点续传
+
+容错约定:
+  - extract_jobs() 的 DOM 兜底：Vue __vue__ 私有 API 失效时，
+    改用已验证的 DOM 选择器 (.job-name/.boss-name/.company-location) 提取
+  - clean_pid_files() 只清桥自己的 pid 文件，不要碰宿主的 ~/.workbuddy/*.pid
+  - register_signal_guard() 捕获 SIGINT（Windows 亦可）
+
+用法:
+    from scripts.webbridge_client import (
+        api, evaluate, navigate, extract_jobs,
+        decrypt_salary, parse_salary_max, handle_popup,
+        scroll_page, ProgressManager, SESSION
+    )
+"""
+
+import json
+import http.client
+import time
+import re
+import random
+import os
+import shutil
+import signal
+import sys
+import difflib
+import glob
+import subprocess
+from datetime import datetime
+
+# ═══════════════════════════════════════════════════════════
+# 常量
+# ═══════════════════════════════════════════════════════════
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 10086
+
+# ★ 全局唯一 SESSION — 所有脚本共用一个标签页
+#   禁止在各脚本中自定义 SESSION 名
+SESSION = "boss-main"
+
+DEFAULT_TIMEOUT = 60
+MAX_RETRIES = 3
+RETRY_DELAY = 3
+
+# ═══════════════════════════════════════════════════════════
+# Boss直聘薪资字体解密
+# ═══════════════════════════════════════════════════════════
+
+def decrypt_salary(text):
+    """解密 Boss直聘薪资字体加密（U+E031~U+E03A → 数字 0~9）"""
+    if not text:
+        return ""
+    result = []
+    for ch in text:
+        cp = ord(ch)
+        if 0xE031 <= cp <= 0xE03A:
+            result.append(str(cp - 0xE031))
+        else:
+            result.append(ch)
+    return ''.join(result)
+
+
+def parse_salary_max(s):
+    """解析薪资字符串，返回最高薪资（K为单位）
+
+    例: "12-20K" → 20, "5-7K·14薪" → 7, "4000-6000元/月" → 6
+    """
+    if not s:
+        return 0
+    s = re.sub(r'·\d+薪', '', s)
+    m = re.search(r'(\d+)-(\d+)K', s)
+    if m:
+        return int(m.group(2))
+    m = re.search(r'(\d+)-(\d+)元/月', s)
+    if m:
+        return int(m.group(2)) / 1000
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════
+# 模块级 API 函数（自带重试）
+# ═══════════════════════════════════════════════════════════
+
+# ───────────────────────────────────────────────────────────
+# 后端选择：WebBridge（扩展）或 CDP（免扩展）
+# ───────────────────────────────────────────────────────────
+
+_BACKEND = {"name": "", "at": 0.0}
+_BACKEND_OBJ = {"cdp": None, "playwright": None}
+
+
+def cdp_port():
+    return int(os.environ.get("BOSS_CDP_PORT") or 9222)
+
+
+def _cdp_ready():
+    try:
+        from scripts import cdp_client
+        return cdp_client.available(cdp_port())
+    except Exception:
+        return False
+
+
+def _pw_ready():
+    """Playwright 装了没 + 端口通不通。装了就用它——库比手写协议可靠。"""
+    try:
+        from scripts import playwright_backend
+        return playwright_backend.available(cdp_port())
+    except Exception:
+        return False
+
+
+def backend(force=False):
+    """当前该用哪条通道：'webbridge' / 'cdp' / 'playwright' / ''（都没有）。
+
+    优先级：内置 CDP → WebBridge（现成用户在用的扩展）→ Playwright（仅显式指定）。
+    BOSS_BACKEND 可强制指定，none/off 表示按"无通道"处理（自检和排障用）。
+
+    为什么 Playwright 不再自动选用（2026-11-05 实测，见 pitfalls #32）：
+    在 WorkBuddy 沙箱里，脚本以 playwright 后端连接调试浏览器后，浏览器会在
+    首次 evaluate 前后整体退出（无崩溃转储、serve 报端口消失）——同一条命令
+    BOSS_BACKEND=cdp 则完全正常，A/B 对照复现 4 次。在修出根因之前，playwright
+    只在用户显式 BOSS_BACKEND=playwright 时启用（普通终端环境它仍然是好东西）。
+    """
+    want = (os.environ.get("BOSS_BACKEND") or "").strip().lower()
+    if want in ("none", "off"):
+        return ""                     # 强制"无后端"，用于自检和排障
+    if want in ("webbridge", "cdp", "playwright"):
+        return want
+    now = time.time()
+    if not force and _BACKEND["name"] and now - _BACKEND["at"] < 15:
+        return _BACKEND["name"]
+    if _port_up():
+        # 默认 CDP 优先，避免 WorkBuddy 沙箱里扩展/Playwright 通道的不确定性。
+        # cdp 不要求 _pw_ready()：它覆盖主流程全部动作（evaluate/navigate/
+        # click/list_tabs/activate_tab/close_tab/bring_to_front），且补发链路
+        # （base64 分片注入组 Blob）已实测走通。playwright 见 docstring。
+        name = "cdp"
+    elif bridge_alive():
+        name = "webbridge"
+    else:
+        name = ""
+    _BACKEND.update(name=name, at=now)
+    return name
+
+
+def _port_up():
+    return _cdp_ready()
+
+
+def _cdp_backend():
+    from scripts import cdp_client
+    if _BACKEND_OBJ["cdp"] is None:
+        _BACKEND_OBJ["cdp"] = cdp_client.Backend(cdp_port())
+    return _BACKEND_OBJ["cdp"]
+
+
+def _pw_backend():
+    from scripts import playwright_backend
+    if _BACKEND_OBJ["playwright"] is None:
+        _BACKEND_OBJ["playwright"] = playwright_backend.Backend(cdp_port())
+    return _BACKEND_OBJ["playwright"]
+
+
+def api(action, args=None, session=SESSION, host=DEFAULT_HOST, port=DEFAULT_PORT, timeout=DEFAULT_TIMEOUT):
+    """发送动作请求，返回解析后的 dict。
+
+    有三条后端，调用方不需要知道用的是哪条：
+      · webbridge   —— Kimi WebBridge 扩展 + 本地服务（端口 10086）
+      · playwright  —— 连到调试端口上的浏览器，点击/等待/上传都交给库
+      · cdp         —— 内置的协议直连，既没装库也没扩展时的兜底
+    选择逻辑见 backend()；用 BOSS_BACKEND=webbridge|playwright|cdp 可强制指定。
+    """
+    be = backend()
+    if be == "playwright":
+        return _pw_backend().api(action, args or {}, session, timeout=timeout)
+    if be == "cdp":
+        return _cdp_backend().api(action, args or {}, session, timeout=timeout)
+
+    if args is None:
+        args = {}
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            conn = http.client.HTTPConnection(host, port, timeout=timeout)
+            body = json.dumps({"action": action, "args": args, "session": session}).encode("utf-8")
+            conn.request("POST", "/command", body=body, headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            data = json.loads(resp.read().decode("utf-8"))
+            conn.close()
+            return data
+        except Exception as e:
+            last_error = e
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+    raise last_error
+
+
+def evaluate(code, session=SESSION):
+    """执行 JS 并返回字符串结果"""
+    r = api("evaluate", {"code": code}, session=session)
+    return r.get("data", {}).get("value", "")
+
+
+class PageLandingError(Exception):
+    """导航落点校验失败：以为打开页面A，实际打开的是页面B。"""
+    pass
+
+
+def assert_landing(session=SESSION, expect_url_contains=None,
+                   require_texts=None, forbid_texts=None, label="页面"):
+    """导航后【必须】回读 DOM 确认落点，杜绝"以为打开A实际B"。
+
+    参数:
+      expect_url_contains: location.href 必须包含此串（确认到了预期路由）
+      require_texts:       body.innerText 必须命中其中【任一】（确认内容渲染对了）
+      forbid_texts:        body.innerText 不得命中其中【任一】（命中即说明落错页）
+    任一不满足即抛 PageLandingError。
+    """
+    actual_url = evaluate("location.href", session=session) or ""
+    body = evaluate("document.body.innerText", session=session) or ""
+    if expect_url_contains and expect_url_contains not in actual_url:
+        raise PageLandingError(
+            f"[落点校验失败·{label}] URL 应含 '{expect_url_contains}'，实际 '{actual_url}'")
+    if forbid_texts:
+        hit = [t for t in forbid_texts if t in body]
+        if hit:
+            raise PageLandingError(
+                f"[落点校验失败·{label}] 命中禁止文本 {hit}（落错页），URL='{actual_url}'")
+    if require_texts:
+        if not any(t in body for t in require_texts):
+            raise PageLandingError(
+                f"[落点校验失败·{label}] 期望含 {require_texts} 任一但未命中，URL='{actual_url}'")
+    return True
+
+
+def navigate(url, wait_range=(4, 6), session=SESSION,
+             expect_url_contains=None, require_texts=None, forbid_texts=None, label="页面"):
+    """导航到 URL 并等待 SPA 渲染。
+
+    ⚠ 防御性：只要传入 expect_url_contains / require_texts / forbid_texts 中任一，
+      导航后会自动回读 DOM 调用 assert_landing 校验落点，失败抛 PageLandingError。
+      调用方【必须】为关键导航声明期望——不声明即视为"未确认落点"的隐患。
+    """
+    r = api("navigate", {"url": url}, session=session)
+    time.sleep(random.uniform(*wait_range))
+    if expect_url_contains or require_texts or forbid_texts:
+        assert_landing(session=session, expect_url_contains=expect_url_contains,
+                       require_texts=require_texts, forbid_texts=forbid_texts, label=label)
+    return r
+
+
+def click(selector, session=SESSION):
+    """通过 CSS 选择器点击元素"""
+    return api("click", {"selector": selector}, session=session).get("data", {}).get("success", False)
+
+
+def js_click(selector, session=SESSION):
+    """用 DOM 原生 click 点元素，返回是否点到。
+
+    与 click() 的区别：click() 走真实鼠标事件（Input.dispatchMouseEvent），
+    在后台标签页(document.hidden=true)会被 Chromium 丢弃——事件发出去了，
+    页面毫无反应，而调用方拿到的是 True。js_click 走 DOM 事件派发，
+    不受可见性影响，是那种情况下的唯一可行路径。
+    """
+    try:
+        return bool(evaluate(
+            "(function(){var el=document.querySelector(%s);if(!el)return false;"
+            "el.click();return true;})()" % json.dumps(selector), session=session))
+    except Exception:
+        return False
+
+
+def click_verified(selector, expect_js=None, timeout=5.0, poll=0.35, session=SESSION):
+    """点击并确认「真的点到了」，鼠标事件无效时自动改用 JS 点击。
+
+    为什么需要（2026-11-06 实测）：标签页在后台时，click() 返回 True 但页面
+    毫无变化——成功的只是「事件发送」这一步。调用方信了 True 会一路「成功」
+    到底却什么都没发生（当天的表现是所有 open 都 panel_ok:false、所有补发
+    都 SKIP 标题不符，日志里一个错都没有）。
+
+    expect_js: JS 表达式，返回真表示点击已生效。不传则退化为「点击后元素
+    状态是否变化」的弱校验（没有 expect 时只能保证动作发出去了）。
+
+    返回 (ok, method)，method ∈ {"mouse", "js", "none"}，便于日志区分是靠哪条
+    路径成功的——连续出现 "js" 说明当前环境在丢鼠标事件。
+    """
+    def _passes():
+        if not expect_js:
+            return None
+        try:
+            v = str(evaluate(expect_js, session=session)).strip().lower()
+            return v in ("true", "1", "yes")
+        except Exception:
+            return False
+
+    click(selector, session=session)
+    if expect_js is None:
+        return True, "mouse"
+    # 两段共用同一个总预算：鼠标阶段最多花一半，剩下的留给 JS 兜底。
+    # 各给 timeout/2 会让总耗时超出声明的 timeout（实测 5s 配置跑出 6s），
+    # 而且页面在 3s 才生效时，JS 阶段只剩 2.5s，会被判成假失败。
+    deadline = time.time() + timeout
+    mouse_deadline = time.time() + timeout * 0.5
+    while time.time() < mouse_deadline:
+        if _passes():
+            return True, "mouse"
+        time.sleep(poll)
+
+    js_click(selector, session=session)
+    while time.time() < deadline:
+        if _passes():
+            return True, "js"
+        time.sleep(poll)
+    return False, "none"
+
+
+def click_card(jid, expect_js=None, timeout=5.0, session=SESSION):
+    """点岗位卡片容器（li），而不是卡片里的岗位链接。
+
+    2026-11-06 实测：点 `a.job-name` 不会触发 SPA 的选中逻辑，右侧详情不切换；
+    点它最近的 li 才行。这里统一走 JS 点击（DOM 事件不受标签页可见性影响），
+    再按 expect_js 校验面板是否真的切过去了。
+    """
+    from scripts import locators
+    try:
+        r = str(evaluate(locators.click_card_js(jid), session=session) or "")
+    except Exception:
+        return False, "error"
+    if r.startswith("ABSENT"):
+        return False, "absent"
+    if not r.startswith("CLICKED"):
+        # 除了 ABSENT 只认 CLICKED；其他任何回包（空串、异常字符串）都不能当成功
+        return False, "unexpected:" + r[:40]
+    if not expect_js:
+        return True, "js"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            v = str(evaluate(expect_js, session=session)).strip().lower()
+            if v in ("true", "1", "yes"):
+                return True, "js"
+        except Exception:
+            pass
+        time.sleep(0.4)
+    return False, "clicked_not_switched"
+
+
+def scroll_page(session=SESSION):
+    """滚动到页面底部，触发懒加载"""
+    evaluate("(function(){window.scrollTo(0, document.body.scrollHeight);return document.body.scrollHeight;})()", session=session)
+
+
+# ═══════════════════════════════════════════════════════════
+# 页面反馈检测 / 异常检测 / 标签页独占锁
+# （落实"每步操作后必须回读页面确认反馈/跳转，
+#   发现页面异常立即停脚本"的硬性纪律）
+# ═══════════════════════════════════════════════════════════
+
+class AbortScriptError(Exception):
+    """页面/环境级异常：必须立即停止【整个】脚本（不是跳过单个岗位）。
+
+    与 PageLandingError 的区别：
+      - PageLandingError 仅表示"某次导航落点不对"，由调用方决定跳过/重试。
+      - AbortScriptError 表示"环境坏了"（登录墙/风控/空白页/标签被劫持/
+        达到每日上限等），必须终止整批，等待人工介入。
+    """
+
+
+# 登录墙 / 安全验证 —— 命中即认为会话失效，需人工重登
+_ANOMALY_LOGIN = [
+    "请先登录", "扫码登录", "登录已过期", "请登录后", "BOSS直聘登录",
+    "账号未登录", "登录状态已失效",
+]
+
+# 风控 / 反爬 / 账号风险 —— 命中即停，避免被封
+_ANOMALY_RISK = [
+    "操作过于频繁", "系统检测到您的账号", "账号存在风险", "行为异常",
+    "请进行安全验证", "风险校验", "暂时无法操作", "请稍后再试", "验证码",
+    "网络环境异常", "被限制",
+]
+
+
+def snapshot_page(session=SESSION):
+    """只读快照：返回 (url, body_text, body_len)，【不导航】。供监督与异常检测。"""
+    url = evaluate("window.location.href", session=session) or ""
+    body = evaluate("document.body.innerText", session=session) or ""
+    return url, body, len(body)
+
+
+def detect_page_anomaly(session=SESSION, allow_login_wall=True, check_blank=True):
+    """检测【页面/环境级】异常（环境坏了，必须停脚本）。
+
+    返回 (is_anomaly, detail)。
+    参数 allow_login_wall: 某些场景登录是预期内（如刚启动），可由调用方关掉该项。
+    参数 check_blank: 是否把"空白/内容过少"判为异常。wait_for_feedback 轮询时
+       传 False —— 点击/导航过程中页面会瞬时空白(跳转中)，属正常过渡，不应误判
+       为异常中止整批；只有登录墙/风控/安全验证才是真异常，仍立即中止。
+    """
+    url, body, blen = snapshot_page(session=session)
+    # 空白页 / 渲染失败（仅 check_blank 时判异常；过渡态空白由调用方容忍）
+    if check_blank and blen < 60:
+        return True, f"页面空白或内容过少(body_len={blen})，可能渲染失败/被重定向"
+    # URL 跳登录
+    if "passport" in url or ("login" in url and "zhipin.com" in url):
+        return True, f"页面跳转到登录页: {url[:90]}"
+    if allow_login_wall:
+        for p in _ANOMALY_LOGIN:
+            if p in body:
+                return True, f"登录墙/安全验证命中: '{p}'"
+    for p in _ANOMALY_RISK:
+        if p in body:
+            return True, f"风控/异常命中: '{p}'"
+    return False, ""
+
+
+def wait_for_feedback(expected_texts, timeout=8, poll=0.5,
+                      anomaly_check=True, forbid_texts=None, session=SESSION):
+    """操作（点击/导航）后，【轮询 DOM 等待预期反馈出现】，确认动作生效。
+
+    这是落实"检测到页面有相应的反馈或者跳转后才进行下一步"的核心门控：
+      - 命中 expected_texts 任一 → 返回该文本（反馈已确认）。
+      - 命中 forbid_texts 任一 → 抛 AbortScriptError（出现了不该出现的异常态）。
+      - 若 anomaly_check 且发现页面级异常 → 抛 AbortScriptError。
+      - 超时仍未命中 → 返回 None（交由调用方判断，通常记为 unknown/fail 并跳过该岗位）。
+
+    注意：本函数【不抛 PageLandingError】，而是抛 AbortScriptError 以便整批停止。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if anomaly_check:
+            # 容忍过渡态空白(check_blank=False)：登录墙/风控/安全验证仍立即中止
+            is_anom, detail = detect_page_anomaly(session=session, check_blank=False)
+            if is_anom:
+                raise AbortScriptError(f"等待反馈时检测到页面异常: {detail}")
+        body = evaluate("document.body.innerText", session=session) or ""
+        if forbid_texts:
+            hit = [t for t in forbid_texts if t in body]
+            if hit:
+                raise AbortScriptError(f"等待反馈时出现禁止态 {hit}（页面异常）")
+        for t in expected_texts:
+            if t in body:
+                return t
+        time.sleep(poll)
+    return None
+
+
+def _list_other_boss_script_pids():
+    """枚举除自己外、正在运行的本项目脚本进程 pid。
+
+    仅靠进程名不够，必须看命令行含本项目的入口文件名，避免误杀用户其它 python 程序。
+    早期版本写死了 `boss-zhipin-deliver/scripts/phase`，换个安装目录或换 skill 名
+    就永远匹配不到，标签页互抢的问题会静默回来。
+
+    这里必须同时匹配 `send_followup.py` 和它的兼容壳 `send_img2.py`：用旧命令起的长任务，
+    进程命令行里是壳的名字，只认新名会让 `--same-tab` 前的清理漏掉它，于是两个进程抢标签页
+    ——表现是「莫名其妙发到错的会话」，而不是报错。壳删掉后这两个名字可以收敛成一个。
+    """
+    me = os.getpid()
+    if not sys.platform.startswith("win"):
+        # macOS / Linux：pgrep -f 直接按命令行匹配，比 Get-CimInstance 简单得多
+        try:
+            r = subprocess.run(
+                ["pgrep", "-f", "_live_driver.py|phase_stream.py|send_followup.py|send_img2.py"],
+                capture_output=True, text=True, timeout=20)
+            return [int(x) for x in r.stdout.split() if x.isdigit() and int(x) != me]
+        except Exception:
+            return []
+    try:
+        # 三处都不能省：
+        # 1. -Filter 里用 PS 自己的引号规则（外层双引号、内层单引号）。写 \" 是 JSON/C 的习惯，
+        #    PowerShell 只认反引号，会把整个过滤器当非法值，抛中文错误——stdout 空、
+        #    stderr 是 GBK，接着按 UTF-8 解码抛异常，被 except 吞成 []，于是清理永远"成功但没事干"。
+        # 2. 先把控制台输出改成 UTF-8，再取字节自己解码，不依赖系统代码页。
+        # 3. 不传 text=True：中文 Windows 上默认按 UTF-8 解 GBK 会炸在 reader 线程里。
+        ps = ("[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+              "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\""
+              " | Where-Object { ($_.CommandLine -like '*_live_driver.py*'"
+              " -or $_.CommandLine -like '*phase_stream.py*'"
+              " -or $_.CommandLine -like '*send_followup.py*'"
+              " -or $_.CommandLine -like '*send_img2.py*')"
+              " -and $_.ProcessId -ne %d }"
+              " | Select-Object -ExpandProperty ProcessId") % me
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                           capture_output=True, timeout=20)
+        out = r.stdout.decode("utf-8", "ignore") or r.stdout.decode("gbk", "ignore")
+        return [int(x.strip()) for x in out.split() if x.strip().isdigit()]
+    except Exception:
+        return []
+
+
+def kill_other_boss_scripts():
+    """启动前强制清场：杀掉其它正在运行的 boss 脚本（防止抢同一标签页）。
+
+    返回被杀死的 pid 列表。
+    """
+    killed = []
+    for pid in _list_other_boss_script_pids():
+        try:
+            r = subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                               capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                killed.append(pid)
+        except Exception:
+            pass
+    return killed
+
+
+# 标签页独占锁文件（记录当前占用脚本的 pid，供监督者读取"谁在控制 tab"）
+# 放在工作目录：早期版本写死在 ~/.workbuddy/skills/... 下，换工具/换机器就失效。
+try:
+    from scripts import paths as _paths
+    _TAB_LOCK_PATH = _paths.state(".tab_lock")
+except Exception:                                    # pragma: no cover
+    _TAB_LOCK_PATH = os.path.join(os.path.expanduser("~"), ".boss-daily-apply", ".tab_lock")
+
+
+def acquire_tab_lock(script_name="unknown"):
+    """占用标签页：先杀其它 boss 脚本保证单例，再写锁文件。
+
+    返回被清场的 pid 列表（供日志汇报）。
+    """
+    killed = kill_other_boss_scripts()
+    info = {
+        "pid": os.getpid(),
+        "script": script_name,
+        "started": datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        with open(_TAB_LOCK_PATH, "w", encoding="utf-8") as f:
+            json.dump(info, f, ensure_ascii=False)
+    except Exception:
+        pass
+    return killed
+
+
+def release_tab_lock():
+    try:
+        if os.path.exists(_TAB_LOCK_PATH):
+            os.remove(_TAB_LOCK_PATH)
+    except Exception:
+        pass
+
+
+def read_tab_lock():
+    """监督者读取：当前谁在控制标签页。返回 dict 或 None。"""
+    try:
+        if os.path.exists(_TAB_LOCK_PATH):
+            with open(_TAB_LOCK_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        return None
+    return None
+
+
+# ═══════════════════════════════════════════════════════════
+# Boss直聘 专用工具函数
+# ═══════════════════════════════════════════════════════════
+
+# Vue $props.data 提取（首选，字段最完整）
+_EXTRACT_JOBS_VUE_JS = r"""
+(function(){
+    var cards = document.querySelectorAll('.job-card-wrap');
+    var jobs = [];
+    var seen = new Set();
+    for (var i = 0; i < cards.length; i++) {
+        try {
+            var d = cards[i].__vue__.$props.data;
+            if (!d || !d.encryptJobId) continue;
+            var jid = d.encryptJobId;
+            if (seen.has(jid)) continue;
+            seen.add(jid);
+            jobs.push({
+                title: d.jobName || "",
+                salary: d.salaryDesc || "",
+                city: d.cityName || "",
+                company: d.brandName || "",
+                industry: d.brandIndustry || "",
+                scale: d.brandScaleName || "",
+                stage: d.brandStageName || "",
+                online: !!d.bossOnline,
+                welfare: (d.welfareList || []).join("|"),
+                degree: d.jobDegree || "",
+                experience: d.jobExperience || "",
+                jobId: jid,
+            });
+        } catch(e) {}
+    }
+    return JSON.stringify({total: jobs.length, list: jobs});
+})()
+"""
+
+# DOM 兜底提取：Vue 私有 API 失效时改用已验证选择器
+#   公司名 → .boss-name  （不是 .company-name）
+#   地区   → .company-location（不是 .job-area）
+#   标题   → a.job-name（含 href /job_detail/{jobId}.html）
+_EXTRACT_JOBS_DOM_JS = r"""
+(function(){
+    var links = document.querySelectorAll('a[href*="job_detail"]');
+    var jobs = [];
+    var seen = {};
+    for (var i = 0; i < links.length; i++) {
+        var a = links[i];
+        var title = (a.innerText || '').trim().split('\n')[0];
+        var href = a.getAttribute('href') || '';
+        var m = href.match(/\/job_detail\/([^.?]+)/);
+        var jid = m ? m[1] : '';
+        if (!jid || seen[jid]) continue;
+        seen[jid] = 1;
+        var card = a.closest('li') || a.parentElement;
+        var salary = '', company = '', location = '';
+        if (card) {
+            var salEl = card.querySelector('.job-salary') || card.querySelector('[class*="salary"]');
+            salary = salEl ? (salEl.innerText || '').trim() : '';
+            var compEl = card.querySelector('.boss-name');
+            company = compEl ? (compEl.innerText || '').trim() : '';
+            var locEl = card.querySelector('.company-location');
+            location = locEl ? (locEl.innerText || '').trim() : '';
+        }
+        jobs.push({
+            title: title, salary: salary, city: location, company: company,
+            industry: '', scale: '', stage: '', online: false,
+            welfare: '', degree: '', experience: '', jobId: jid, href: href,
+        });
+    }
+    return JSON.stringify({total: jobs.length, list: jobs});
+})()
+"""
+
+
+def _parse_jobs(raw):
+    """解析 extract_jobs 的 JS 返回（JSON 或空）"""
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        return data.get("list", [])
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def extract_jobs(session=SESSION):
+    """从当前页面提取所有岗位卡片。
+
+    策略：先尝试 Vue $props.data（字段最完整），
+    若返回为空（Vue 私有 API 失效/页面结构变化），回退到 DOM 选择器提取。
+    薪资已解密，并按 jobId 去重。
+    """
+    jobs = _parse_jobs(evaluate(_EXTRACT_JOBS_VUE_JS, session=session))
+    if not jobs:
+        jobs = _parse_jobs(evaluate(_EXTRACT_JOBS_DOM_JS, session=session))
+
+    # 按 jobId 去重（同一卡片可能同时被两种提取命中）
+    merged = {}
+    for j in jobs:
+        jid = j.get('jobId', '')
+        if jid and jid not in merged:
+            merged[jid] = j
+    for j in merged.values():
+        j['salary'] = decrypt_salary(j.get('salary', ''))
+    return list(merged.values())
+
+
+_POPUP_SELECTORS = [
+    '.btn-sure',
+    '.dialog-container .btn',
+    '.greet-pop .btn',
+    '.dialog-confirm', '.layer-btn-confirm', '.btn-confirm',
+    '.dialog-ok', '.modal-confirm', '.layui-layer-btn0',
+]
+
+
+def handle_popup(session=SESSION):
+    """检测并处理弹窗（特别是第120份时的"好"弹窗）"""
+    time.sleep(1.5)
+
+    result = evaluate("""
+    (function(){
+        var prioritySelectors = %s;
+        for (var j = 0; j < prioritySelectors.length; j++) {
+            var btn = document.querySelector(prioritySelectors[j]);
+            if (btn) {
+                var rect = btn.getBoundingClientRect();
+                var style = window.getComputedStyle(btn);
+                if (rect.width > 0 && rect.height > 0 && style.display !== 'none') {
+                    btn.click();
+                    return 'clicked: ' + prioritySelectors[j];
+                }
+            }
+        }
+        var btns = document.querySelectorAll('button, a');
+        for (var i = 0; i < btns.length; i++) {
+            var el = btns[i];
+            var text = (el.textContent || '').trim();
+            if (text === '好' || text === '确定' || text === '我知道了' || text === '继续沟通') {
+                var rect = el.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) {
+                    el.click();
+                    return 'clicked: ' + text + ' (' + el.tagName + '.' + el.className + ')';
+                }
+            }
+        }
+        return 'no_popup';
+    })()
+    """ % json.dumps(_POPUP_SELECTORS), session=session)
+
+    if result and result != 'no_popup':
+        time.sleep(1)
+        still_visible = evaluate("""
+        (function(){
+            var dialog = document.querySelector('.dialog-wrap.greet-pop, .dialog-container');
+            if (!dialog) return false;
+            var rect = dialog.getBoundingClientRect();
+            var style = window.getComputedStyle(dialog);
+            return (rect.width > 0 && rect.height > 0 && style.display !== 'none');
+        })()
+        """, session=session)
+        if still_visible == 'true':
+            evaluate("""
+            (function(){
+                var btn = document.querySelector('.btn-sure');
+                if (btn) {
+                    var rect = btn.getBoundingClientRect();
+                    var x = rect.left + rect.width / 2;
+                    var y = rect.top + rect.height / 2;
+                    ['mousedown', 'mouseup', 'click'].forEach(function(type) {
+                        var evt = new MouseEvent(type, {
+                            bubbles: true, cancelable: true, view: window,
+                            clientX: x, clientY: y
+                        });
+                        btn.dispatchEvent(evt);
+                    });
+                    return 'mouse_event_clicked';
+                }
+                return 'no_btn_sure';
+            })()
+            """, session=session)
+            time.sleep(1)
+            return result + ' + retry_mouse'
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════
+# 进度管理（断点续传）
+# ═══════════════════════════════════════════════════════════
+
+class ProgressManager:
+    """投递进度管理器 — 支持断点续传
+
+    用法:
+        pm = ProgressManager()
+        pm.load()
+        if pm.is_done(job_id):
+            continue
+        pm.add_delivered(job_id, job)
+        pm.save()
+    """
+
+    def __init__(self, filepath="stream_progress.json"):
+        self.filepath = filepath
+        self.data = {"delivered": [], "failed": [], "blocked": []}
+
+    def load(self):
+        if os.path.exists(self.filepath):
+            try:
+                with open(self.filepath, 'r', encoding='utf-8') as f:
+                    self.data = json.load(f)
+            except json.JSONDecodeError:
+                # 主文件坏了就退回上一次的备份，别让整批记录作废
+                bak = self.filepath + ".bak"
+                if os.path.exists(bak):
+                    with open(bak, 'r', encoding='utf-8') as f:
+                        self.data = json.load(f)
+                    print("[progress] 主文件损坏，已从 %s 恢复" % bak, flush=True)
+                else:
+                    raise
+        # 兼容旧数据：被日上限拦截的岗位曾误记在 failed（reason 含"日上限"），
+        # 自愈归位到 blocked —— blocked 不计入 is_done，明日配额重置后可重试
+        self.data.setdefault("blocked", [])
+        moved = 0
+        remaining = []
+        for item in self.data.get("failed", []):
+            if "日上限" in (item.get("reason") or ""):
+                item.setdefault("result", "blocked")
+                self.data["blocked"].append(item)
+                moved += 1
+            else:
+                remaining.append(item)
+        if moved:
+            self.data["failed"] = remaining
+        return self
+
+    def save(self):
+        # 原子写：先写 .tmp 再 os.replace。原来直接 'w' 截断，
+        # 一旦写盘中途被 Ctrl-C / 异常打断，217 条投递记录会变成半截 JSON，
+        # 主流程起不来、所有去重失效（会把已投岗位当新卡重复投）。
+        tmp = self.filepath + ".tmp"
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.path.exists(self.filepath):
+            try:
+                shutil.copyfile(self.filepath, self.filepath + ".bak")
+            except Exception:
+                pass
+        os.replace(tmp, self.filepath)
+
+    @property
+    def delivered_ids(self):
+        return set(j['jobId'] for j in self.data.get('delivered', []))
+
+    @property
+    def failed_ids(self):
+        return set(j['jobId'] for j in self.data.get('failed', []))
+
+    @property
+    def blocked_ids(self):
+        return set(j['jobId'] for j in self.data.get('blocked', []))
+
+    @property
+    def all_done_ids(self):
+        # blocked(被日上限拦截) 不计入 is_done —— 明日配额重置后应重试，避免丢失有效岗位
+        return self.delivered_ids | self.failed_ids
+
+    def is_done(self, job_id):
+        return job_id in self.all_done_ids
+
+    def is_blocked(self, job_id):
+        return job_id in self.blocked_ids
+
+    def add_delivered(self, job_id, job):
+        self.data['delivered'].append({
+            'jobId': job_id,
+            'title': job.get('title', ''),
+            'company': job.get('company', ''),
+            'salary': job.get('salary', ''),
+            'industry': job.get('industry', ''),
+            # direction/city 之前被丢掉，导致汇总页无法按方向分组；
+            # delivered_at 之前完全缺失，导致「今日累计/回复率」这类按天统计做不了。
+            'direction': job.get('direction', ''),
+            'city': job.get('city', ''),
+            'keyword': job.get('keyword', ''),
+            'greeting_src': job.get('greeting_src', ''),
+            'delivered_at': job.get('delivered_at') or datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'result': 'success',
+        })
+
+    def add_failed(self, job_id, job, reason):
+        self.data['failed'].append({
+            'jobId': job_id,
+            'title': job.get('title', ''),
+            'company': job.get('company', ''),
+            'result': 'fail',
+            'reason': reason,
+        })
+
+    def add_blocked(self, job_id, job, reason):
+        """被日上限拦截（未真正投出）—— 单独分类，区别于真实投递失败。"""
+        self.data['blocked'].append({
+            'jobId': job_id,
+            'title': job.get('title', ''),
+            'company': job.get('company', ''),
+            'result': 'blocked',
+            'reason': reason,
+        })
+
+    @property
+    def delivered_count(self):
+        return len(self.data.get('delivered', []))
+
+    @property
+    def failed_count(self):
+        return len(self.data.get('failed', []))
+
+    @property
+    def blocked_count(self):
+        return len(self.data.get('blocked', []))
+
+
+# ═══════════════════════════════════════════════════════════
+# 健康检查与 Daemon 管理
+# ═══════════════════════════════════════════════════════════
+
+def health_check(host=DEFAULT_HOST, port=DEFAULT_PORT):
+    """快速检查 WebBridge daemon 是否可达"""
+    try:
+        conn = http.client.HTTPConnection(host, port, timeout=5)
+        conn.request("GET", "/")
+        status = conn.getresponse().status
+        conn.close()
+        return status == 200 or status == 404
+    except Exception:
+        return False
+
+
+# ───────────────────────────────────────────────────────────
+# 桥没起来时的可读报错（不要让调用方看到 ConnectionRefused 堆栈）
+# ───────────────────────────────────────────────────────────
+
+def bridge_alive(host=DEFAULT_HOST, port=DEFAULT_PORT, timeout=2.0):
+    """端口能不能连上。比 health_check 快，用于开工前的短路判断。"""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+_BRIDGE_HINT = """\
+✗ 两条自动化通道都没通 —— 不是脚本坏了，是浏览器还没接管。
+
+【A · 免扩展，推荐】用浏览器自带的 DevTools 协议（CDP）
+   python scripts/cdp_client.py --launch
+   它用独立 profile 起一个带调试端口的浏览器，第一次在里面扫码登录 BOSS 直聘，
+   之后登录态一直有效。全程不需要装任何扩展。
+   已经在跑了就想确认一下：python scripts/cdp_client.py --check
+
+【B · WebBridge 扩展】已有扩展的话，把服务拉起来
+   1) 看浏览器在不在（Chrome / Edge / Brave / Vivaldi 都行，不限于 Chrome）：
+      python scripts/browser.py --list
+   2) 起服务（后台任务）："{exe}" start --foreground
+   3) 用全路径看状态（它不在 PATH 里，直接敲命令会 command not found）：
+      "{exe}" status
+      netstat -ano | findstr {port}
+
+【C · 两条都走不通】至少还能记账：
+   python scripts/ledger.py --help       # 手动投，脚本负责去重、统计、报表
+
+注意：A 和 B 都不需要 CDP 之外的东西，也不要把浏览器换成 Firefox/Safari ——
+它们没有 Chromium 的调试协议，装不了扩展也连不上 CDP。
+"""
+
+
+def require_bridge(host=DEFAULT_HOST, port=DEFAULT_PORT):
+    """开工前短路：两条后端都不通就打印修复指引并退出（退出码 2）。
+
+    为什么不在 api() 里抛异常：上层脚本太多，每个都要包一层 try；
+    统一在这里挡住，输出比 ConnectionRefusedError 的堆栈有用得多。
+    """
+    # backend() 返回空表示"按无通道处理"（BOSS_BACKEND=none），此时不该放行
+    if backend() and (bridge_alive(host, port) or _port_up()):
+        return True
+    exe = os.path.normpath(os.path.expanduser(
+        os.path.join("~", ".kimi-webbridge", "bin", "kimi-webbridge.exe")))
+    print(_BRIDGE_HINT.format(host=host, port=port, exe=exe), file=sys.stderr)
+    raise SystemExit(2)
+
+
+def ensure_active_tab(session=SESSION, timeout_wait=10):
+    """确保 session 有活跃标签页
+
+    WebBridge active 标志不可靠（navigate 后仍为 False），
+    改为：有标签页就尝试 evaluate，失败才 navigate。
+    """
+    try:
+        if not health_check():
+            return False
+
+        # 有标签页时直接尝试 evaluate
+        r = api("list_tabs", {}, session=session, timeout=5)
+        if r.get("ok"):
+            tabs_data = r.get("data", {})
+            tabs = tabs_data.get("tabs", []) if isinstance(tabs_data, dict) else tabs_data
+            if tabs:
+                if str(evaluate("1+1", session=session)) == "2":
+                    return True
+
+        # 无标签页或不可交互，导航创建
+        nav_r = navigate("https://www.zhipin.com", wait_range=(timeout_wait, timeout_wait + 2), session=session)
+        if not nav_r.get("ok"):
+            return False
+        return str(evaluate("1+1", session=session)) == "2"
+    except Exception:
+        return False
+
+
+def clean_pid_files():
+    """清理 WebBridge 的 PID 残留文件。
+
+    只动桥自己的 pid 文件。早期版本还会顺手删 ~/.workbuddy/*.pid（那是宿主工具
+    的进程文件，和本技能无关），已移除——删别人的 pid 文件只会让宿主状态错乱。
+    """
+    pid_patterns = [
+        os.path.expanduser(os.path.join("~", ".kimi-webbridge", "daemon.pid")),
+        os.path.expanduser(os.path.join("~", ".kimi-webbridge*.pid")),
+    ]
+    cleaned = []
+    for pattern in pid_patterns:
+        for f in glob.glob(pattern):
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                    cleaned.append(f)
+                except Exception:
+                    pass
+    return cleaned
+
+
+# ═══════════════════════════════════════════════════════════
+# 信号安全中断
+# ═══════════════════════════════════════════════════════════
+
+class SafeInterrupt(BaseException):
+    pass
+
+
+def _signal_handler(signum, frame):
+    raise SafeInterrupt(f"Received signal {signum}")
+
+
+def register_signal_guard():
+    """注册信号处理器，SIGTERM / SIGINT 触发 SafeInterrupt 以便保存进度。"""
+    try:
+        signal.signal(signal.SIGTERM, _signal_handler)
+    except (ValueError, AttributeError, OSError):
+        pass  # 非主线程 / 平台不支持时忽略
+    try:
+        signal.signal(signal.SIGINT, _signal_handler)
+    except (ValueError, AttributeError, OSError):
+        pass
+
+
+# ═══════════════════════════════════════════════════════════
+# WebBridge 类
+# ═══════════════════════════════════════════════════════════
+
+class WebBridge:
+    """Kimi WebBridge 通信封装
+
+    用法:
+        wb = WebBridge()
+        wb.navigate(url)
+        jobs = wb.extract_jobs()
+    """
+
+    def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT, session=SESSION, timeout=DEFAULT_TIMEOUT):
+        self.host = host
+        self.port = port
+        self.session = session
+        self.timeout = timeout
+
+    def api(self, action, args=None, timeout=None):
+        return api(action, args, self.session, self.host, self.port, timeout or self.timeout)
+
+    def evaluate(self, code):
+        return evaluate(code, self.session)
+
+    def navigate(self, url, wait_range=(4, 6)):
+        return navigate(url, wait_range, self.session)
+
+    def click(self, selector):
+        return click(selector, self.session)
+
+    def scroll_page(self):
+        return scroll_page(self.session)
+
+    def snapshot(self):
+        return self.api("snapshot", {})
+
+    def screenshot(self, path):
+        return self.api("screenshot", {"path": path})
+
+    def list_tabs(self):
+        r = self.api("list_tabs", {})
+        data = r.get("data", r)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return data.get("tabs", data.get("data", []))
+        return []
+
+    def close_tab(self, tab_id):
+        return self.api("close_tab", {"tabId": tab_id})
+
+    def extract_jobs(self):
+        return extract_jobs(self.session)
+
+    def handle_popup(self):
+        return handle_popup(self.session)
+
+    def ensure_active_tab(self, timeout_wait=10):
+        return ensure_active_tab(self.session, timeout_wait)
+
+    def verify_login(self, username=None):
+        """通用登录态检测（不绑定特定用户名）。
+
+        - username 传入具体名字时：兼容旧用法，检测页面是否含该名字（已登录用户）。
+        - username 为 None（默认）：检测通用登录态——
+            页面不存在登录墙（短信登录/密码登录/扫码登录），
+            且存在已登录用户标志（我的/消息 导航 或 用户头像/用户卡片元素）。
+        这样任何人（不同姓名）复用技能都无需改代码。
+        """
+        body = self.evaluate("document.body.innerText") or ""
+        if username:
+            if username in body:
+                return True
+            time.sleep(5)
+            body = self.evaluate("document.body.innerText") or ""
+            return username in body
+        # 通用检测：非登录墙 + 存在已登录用户标志
+        has_login_wall = ("短信登录" in body) or ("密码登录" in body) or ("扫码登录" in body)
+        logged_in = (
+            ("我的" in body)
+            or ("消息" in body)
+            or bool(self.evaluate(
+                "!!document.querySelector('.user-avatar, .geek-user, .user-card, .nav-user, .avatar')"))
+        )
+        if not has_login_wall and logged_in:
+            return True
+        time.sleep(5)
+        body = self.evaluate("document.body.innerText") or ""
+        has_login_wall = ("短信登录" in body) or ("密码登录" in body) or ("扫码登录" in body)
+        logged_in = ("我的" in body) or ("消息" in body) or bool(
+            self.evaluate("!!document.querySelector('.user-avatar, .geek-user, .user-card, .nav-user, .avatar')"))
+        return (not has_login_wall) and logged_in
+
+    def body_with_retry(self):
+        body = self.evaluate("document.body.innerText") or ""
+        if len(body) < 200:
+            time.sleep(5)
+            body = self.evaluate("document.body.innerText") or ""
+        return body
+
+    def find_chat_button_ref(self):
+        snap = self.snapshot()
+        tree_str = json.dumps(snap, ensure_ascii=False)
+        for p in [
+            r"'name':\s*'立即沟通'.*?'ref':\s*'(@e\d+)'",
+            r"'ref':\s*'(@e\d+)'.*?'name':\s*'立即沟通'",
+            r'"name":\s*"立即沟通".*?"ref":\s*"(@e\d+)"',
+            r'"ref":\s*"(@e\d+)".*?"name":\s*"立即沟通"',
+        ]:
+            m = re.search(p, tree_str)
+            if m:
+                return m.group(1)
+        return None
+
+
