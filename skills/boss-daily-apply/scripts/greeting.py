@@ -280,7 +280,7 @@ def validate_greeting(text, hook="", profile=None, job=None, jd_text="", existin
 
     # 11. 不出现 greeting_facts 之外的公司名 / 奖项
     # 建立敏感白名单
-    allowed_companies = ["中南大学", "广西农业职业技术大学", "北京大学", "清华大学"]
+    allowed_companies = ["中南大学", "示例农业职业技术大学", "北京大学", "清华大学"]
     for item in (facts.get("internships") or []):
         allowed_companies.extend(re.findall(r'[\u4e00-\u9fa5a-zA-Z0-9]+', item))
     for item in (facts.get("awards") or []):
