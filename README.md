@@ -1,6 +1,6 @@
 # agent-skills
 
-我自己的 AI Agent skill 合集，四个都在日常使用，不收录第三方项目。
+我自己的 AI Agent skill 合集，只收我写的，不收录第三方项目。
 
 每个 skill 是一个带 YAML frontmatter 的 `SKILL.md`，放进 agent 的 skills 目录就能用日常说法触发。
 

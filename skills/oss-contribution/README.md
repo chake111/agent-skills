@@ -2,7 +2,7 @@
 
 <p align="center">
   <img src="./assets/readme/hero.svg" width="100%"
-       alt="oss-contribution-skill：项目筛查、机会调研、方案设计、受控实现、PR 描述五个阶段，以及跨会话任务卡">
+       alt="oss-contribution-skill：项目筛查、机会调研、方案设计、受控实现、审查、提交、PR 描述七个阶段，以及跨会话任务卡">
 </p>
 
 让 Agent 按成熟的开源协作节奏推进一次贡献：先判断项目值不值得投入，再定位机会、设计最小改动、受控实现，最后提交 PR。全过程记在一张本地任务卡上，跨会话不丢上下文。
@@ -27,7 +27,7 @@ Codex 换成 `~/.codex/skills/oss-contribution`，其他环境同理。
 - `https://github.com/owner/repo 这个仓库，有什么值得做的`
 - `接着上次的任务卡继续`
 
-想确认有没有装好：让它读一遍 `SKILL.md` 并复述五个阶段，能说对就是加载成功。
+想确认有没有装好：让它读一遍 `SKILL.md` 并复述七个阶段，能说对就是加载成功。
 
 ## 仓库结构
 
@@ -39,6 +39,8 @@ oss-contribution/
 │   ├── research.md       机会调研
 │   ├── design.md         方案设计
 │   ├── implement.md      受控实现
+│   ├── review.md         审查分级
+│   ├── submit.md         提交链路
 │   └── pr.md             PR 描述
 ├── assets/
 │   ├── task-card.md      贡献任务卡模板
@@ -105,7 +107,7 @@ pnpm test queue -- --grep "restart"    修复前失败 2 例，修复后通过
 
 这套流程约束的是节奏：先判断值不值得做，再决定做什么，最后才动代码。
 
-## 五个阶段
+## 七个阶段
 
 默认按顺序推进，也可以从中间切入——手上已有 Issue，就直接进第二阶段。
 
@@ -115,7 +117,9 @@ pnpm test queue -- --grep "restart"    修复前失败 2 例，修复后通过
 | 2 机会调研 | 一个仓库或 Issue | 候选方向若干，自选一个并说明依据 | [research.md](references/research.md) |
 | 3 方案设计 | 选定方向 | 方案对比、工作量估算、维护者评论 | [design.md](references/design.md) |
 | 4 受控实现 | 方案定稿 | 最小 diff、本地构建与测试结果 | [implement.md](references/implement.md) |
-| 5 PR 描述 | 已有改动 | 对齐仓库模板的标题与正文，自检后创建 PR | [pr.md](references/pr.md) |
+| 5 审查分级 | 已有改动 | 判断交子代理审还是人审；重要改动先给心智模型再给 diff | [review.md](references/review.md) |
+| 6 提交链路 | 审查通过 | fork、分支、提交、推送、开 PR；处理 CLA 与 CI | [submit.md](references/submit.md) |
+| 7 PR 描述 | 已有改动 | 对齐仓库模板的标题与正文，自检后创建 PR | [pr.md](references/pr.md) |
 
 三条贯穿全程的硬约束：
 
